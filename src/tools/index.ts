@@ -28,15 +28,29 @@ export interface BuiltinToolsConfig {
  * If a SandboxContext is provided, returns sandbox-backed tools;
  * otherwise returns the standard local tools.
  */
+// Built-in tools that write files or run shell/git. pi-agent-core parallelizes
+// tool calls by default; these must run one-at-a-time or concurrent writes and
+// git operations race (corrupt files, index.lock). read/grep stay parallel.
+const SEQUENTIAL_TOOL_NAMES = new Set([
+	"cli", "write", "edit", "memory", "capture_photo", "task_tracker", "skill_learner",
+]);
+
+function markSequential(tools: AgentTool<any>[]): AgentTool<any>[] {
+	for (const t of tools) {
+		if (SEQUENTIAL_TOOL_NAMES.has(t.name)) t.executionMode = "sequential";
+	}
+	return tools;
+}
+
 export function createBuiltinTools(config: BuiltinToolsConfig): AgentTool<any>[] {
 	if (config.sandbox) {
-		return [
+		return markSequential([
 			createSandboxCliTool(config.sandbox, config.timeout),
 			createSandboxReadTool(config.sandbox),
 			createSandboxWriteTool(config.sandbox),
 			createSandboxEditTool(config.sandbox),
 			createSandboxMemoryTool(config.sandbox),
-		];
+		]);
 	}
 
 	const tools: AgentTool<any>[] = [
@@ -54,5 +68,5 @@ export function createBuiltinTools(config: BuiltinToolsConfig): AgentTool<any>[]
 		tools.push(createSkillLearnerTool(config.dir, config.gitagentDir));
 	}
 
-	return tools;
+	return markSequential(tools);
 }

@@ -89,6 +89,10 @@ async function executeHook(
 			stderr += data.toString("utf-8");
 		});
 
+		// A hook that exits before reading stdin makes this pipe emit EPIPE;
+		// with no listener that's an unhandled 'error' event that crashes the
+		// whole process. Swallow it — the close/error handlers decide the outcome.
+		child.stdin.on("error", () => {});
 		child.stdin.write(JSON.stringify(input));
 		child.stdin.end();
 

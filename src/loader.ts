@@ -1,7 +1,7 @@
 import { readFile, mkdir, writeFile } from "fs/promises";
 import { join } from "path";
 import { randomUUID } from "crypto";
-import { execSync } from "child_process";
+import { execFileSync } from "child_process";
 import { getModel } from "@mariozechner/pi-ai";
 import type { Model } from "@mariozechner/pi-ai";
 import yaml from "js-yaml";
@@ -162,6 +162,24 @@ function deepMerge(base: Record<string, any>, override: Record<string, any>): Re
 	return result;
 }
 
+/**
+ * Clone a git repo using argv (no shell). The URL/branch come from an untrusted
+ * agent.yaml, so they must never be interpolated into a shell string — that was
+ * a load-time RCE (`extends: "$(cmd)"`). Returns false on failure instead of
+ * throwing (preserves the old `|| true` continue-on-failure behavior).
+ */
+export function cloneGitRepo(url: string, dest: string, opts: { cwd: string; branch?: string }): boolean {
+	const args = ["clone", "--depth", "1"];
+	if (opts.branch) args.push("--branch", opts.branch);
+	args.push(url, dest);
+	try {
+		execFileSync("git", args, { cwd: opts.cwd, stdio: "pipe" });
+		return true;
+	} catch {
+		return false;
+	}
+}
+
 async function resolveInheritance(
 	manifest: AgentManifest,
 	agentDir: string,
@@ -178,12 +196,7 @@ async function resolveInheritance(
 	const parentName = manifest.extends.split("/").pop()?.replace(/\.git$/, "") || "parent";
 	const parentDir = join(depsDir, parentName);
 
-	try {
-		execSync(`git clone --depth 1 "${manifest.extends}" "${parentDir}" 2>/dev/null || true`, {
-			cwd: agentDir,
-			stdio: "pipe",
-		});
-	} catch {
+	if (!cloneGitRepo(manifest.extends, parentDir, { cwd: agentDir })) {
 		// Clone failed, continue without parent
 		return { manifest, parentRules: "" };
 	}
@@ -224,14 +237,8 @@ async function resolveDependencies(
 
 	for (const dep of manifest.dependencies) {
 		const depDir = join(depsDir, dep.name);
-		try {
-			execSync(
-				`git clone --depth 1 --branch "${dep.version}" "${dep.source}" "${depDir}" 2>/dev/null || true`,
-				{ cwd: agentDir, stdio: "pipe" },
-			);
-		} catch {
-			// Clone failed, skip this dependency
-		}
+		// Clone failure is non-fatal; skip this dependency.
+		cloneGitRepo(dep.source, depDir, { cwd: agentDir, branch: dep.version });
 	}
 }
 
