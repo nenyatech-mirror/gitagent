@@ -17,6 +17,7 @@ let buildTool: typeof import("../dist/tool-factory.js").buildTool;
 let toAgentTool: typeof import("../dist/tool-utils.js").toAgentTool;
 let runHooks: typeof import("../dist/hooks.js").runHooks;
 let executeScheduledJob: typeof import("../dist/schedule-runner.js").executeScheduledJob;
+let createCliTool: typeof import("../dist/tools/cli.js").createCliTool;
 
 before(async () => {
 	({ cloneGitRepo } = await import("../dist/loader.js"));
@@ -25,6 +26,7 @@ before(async () => {
 	({ toAgentTool } = await import("../dist/tool-utils.js"));
 	({ runHooks } = await import("../dist/hooks.js"));
 	({ executeScheduledJob } = await import("../dist/schedule-runner.js"));
+	({ createCliTool } = await import("../dist/tools/cli.js"));
 });
 
 // ── G1: no shell injection via clone URL/branch ─────────────────────────
@@ -126,5 +128,22 @@ describe("G21 scheduler cleanup", () => {
 		await assert.rejects(() => executeScheduledJob(schedule, opts, false));
 		assert.equal(runCount, 2, "job must run again — runningJobs was cleared in finally");
 		rmSync(dir, { recursive: true, force: true });
+	});
+});
+
+// ── G18: cli must not hang when a background grandchild holds the pipe ───
+
+describe("G18 cli process-group kill", { skip: process.platform === "win32" }, () => {
+	it("times out promptly instead of hanging on a background grandchild", async () => {
+		const cli = createCliTool(tmpdir());
+		const start = Date.now();
+		// `sleep 30 &` outlives the shell and inherits the stdout pipe. Without a
+		// process-group kill, 'close' never fires and this would hang forever.
+		await assert.rejects(
+			() => (cli as any).execute("id", { command: "sleep 30 & echo go", timeout: 2 }),
+			/timed out/i,
+		);
+		const elapsed = Date.now() - start;
+		assert.ok(elapsed < 8000, `cli should reject promptly, took ${elapsed}ms`);
 	});
 });
