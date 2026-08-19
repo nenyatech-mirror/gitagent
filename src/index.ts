@@ -31,6 +31,7 @@ import {
 	initTelemetry,
 	wrapToolWithOtel,
 	startSessionSpan,
+	startTurnTrace,
 	recordGenAiCall,
 	shutdownTelemetry,
 } from "./telemetry.js";
@@ -303,6 +304,11 @@ async function ensureRepo(dir: string, model?: string): Promise<string> {
 
 	return absDir;
 }
+
+// The REPL outlives main(): main() resolves once the prompt loop is wired up, so
+// telemetry must be flushed by whichever exit path the user actually takes, not
+// when main()'s promise settles.
+let _replActive = false;
 
 async function main(): Promise<void> {
 	// Handle plugin subcommand: gitagent plugin <install|list|remove|...>
@@ -643,6 +649,7 @@ async function main(): Promise<void> {
 	// Single-shot mode
 	if (prompt) {
 		try {
+			startTurnTrace(loaded.model);
 			await otelContext.with(_session.ctx, () => agent.prompt(prompt));
 		} catch (err: any) {
 			auditLogger?.logError(err.message).catch(() => {});
@@ -702,6 +709,7 @@ async function main(): Promise<void> {
 				} catch {
 					/* ignore */
 				}
+				await shutdownTelemetry().catch(() => {});
 				process.exit(0);
 			}
 
@@ -804,6 +812,7 @@ async function main(): Promise<void> {
 			}
 
 			try {
+				startTurnTrace(loaded.model);
 				await otelContext.with(_session.ctx, () => agent.prompt(promptText));
 			} catch (err: any) {
 				console.error(red(`Error: ${err.message}`));
@@ -843,10 +852,13 @@ async function main(): Promise<void> {
 			try {
 				_session.end({ "gitagent.cost_usd": _totalCostUsd });
 			} catch { /* ignore */ }
-			Promise.all([mcpSetup.cleanup(), stopSandbox()]).finally(() => process.exit(0));
+			Promise.all([mcpSetup.cleanup(), stopSandbox()])
+				.finally(() => shutdownTelemetry().catch(() => {}))
+				.finally(() => process.exit(0));
 		}
 	});
 
+	_replActive = true;
 	ask();
 }
 
@@ -856,7 +868,12 @@ process.on("SIGTERM", () => {
 });
 
 main()
-  .finally(() => shutdownTelemetry().catch(() => {}))
+  .finally(() => {
+    // Single-shot mode ends here; the REPL flushes from its own exit paths.
+    // finally runs before the catch below, so a prompt that throws still
+    // flushes before process.exit discards anything pending.
+    if (!_replActive) shutdownTelemetry().catch(() => {});
+  })
   .catch((err) => {
     console.error(red(`Fatal: ${err.message}`));
     process.exit(1);
