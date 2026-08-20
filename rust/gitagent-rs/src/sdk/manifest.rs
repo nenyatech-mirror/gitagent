@@ -66,8 +66,11 @@ pub struct AgentManifest {
     #[serde(default)]
     pub description: String,
     pub model: ModelConfig,
+    /// Tool allow-list. Omitted → all builtin tools. `[]` → no tools (needed for
+    /// models without tool-calling, e.g. small local models). A named list →
+    /// exactly those tools.
     #[serde(default)]
-    pub tools: Vec<String>,
+    pub tools: Option<Vec<String>>,
     #[serde(default)]
     pub runtime: Option<Runtime>,
     #[serde(default)]

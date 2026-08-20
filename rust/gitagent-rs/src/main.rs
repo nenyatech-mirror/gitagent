@@ -1,19 +1,21 @@
-//! gitagent CLI — a thin front-end over the SDK. All agent behavior lives in the
-//! library (`gitagent::sdk` / `::pi`); this binary only parses flags and hands
+//! Ira CLI — a thin front-end over the SDK. All agent behavior lives in the
+//! library (`ira::sdk` / `::pi`); this binary only parses flags and hands
 //! off to the `cli` renderer.
 
 mod cli;
+mod tui;
+
 
 use clap::Parser;
-use gitagent::sdk::env::load_env;
-use gitagent::sdk::goal::Goal;
-use gitagent::sdk::query::QueryOptions;
-use gitagent::sdk::session::{repo_name, RepoOptions};
+use ira::sdk::env::load_env;
+use ira::sdk::goal::Goal;
+use ira::sdk::query::QueryOptions;
+use ira::sdk::session::{repo_name, RepoOptions};
 use std::path::PathBuf;
 
-/// Git-native AI agent (Rust core — faithful pi-core engine).
+/// Ira — a git-native AI agent (Rust core, faithful pi-core engine).
 #[derive(Parser)]
-#[command(name = "gitagent", version, about)]
+#[command(name = "ira", version, about)]
 struct Args {
     /// Agent directory (contains agent.yaml). With --repo, the clone target.
     #[arg(short, long, default_value = ".")]
@@ -40,13 +42,35 @@ struct Args {
     /// Max self-correcting attempts in goal mode (default 3).
     #[arg(long)]
     max_attempts: Option<u32>,
-    /// The prompt to run. Omit for an interactive REPL.
+    /// Launch the full-screen chat TUI (interactive mode).
+    #[arg(long)]
+    tui: bool,
+    /// Launch the desktop web UI (Heritage design) in your browser.
+    #[arg(long)]
+    ui: bool,
+    /// The prompt to run. Omit for interactive mode.
     prompt: Option<String>,
 }
 
 #[tokio::main]
 async fn main() {
-    let args = Args::parse();
+    let mut args = Args::parse();
+
+    // Resolve the agent dir to an absolute path and fail FAST with a helpful
+    // message if it isn't an agent — not at the first message. (Repo mode is
+    // exempt: the clone target may not exist yet.)
+    if args.repo.is_none() {
+        let dir = PathBuf::from(&args.dir);
+        let abs = std::fs::canonicalize(&dir).unwrap_or(dir);
+        if !abs.join("agent.yaml").exists() {
+            eprintln!("error: no agent.yaml in '{}'", abs.display());
+            eprintln!("hint:  pass the agent directory explicitly, e.g.");
+            eprintln!("         ira -d /path/to/agent {}", if args.ui { "--ui" } else { "\"your prompt\"" });
+            eprintln!("       or cd into a directory that contains agent.yaml first.");
+            std::process::exit(2);
+        }
+        args.dir = abs.display().to_string();
+    }
 
     // Load ~/.gitagent/.env then <dir>/.env (API keys, GITAGENT_MODEL_BASE_URL).
     load_env(&PathBuf::from(&args.dir));
@@ -78,10 +102,17 @@ async fn main() {
             })
             .await
         }
-        // No prompt → interactive REPL.
+        // No prompt → interactive: web UI, TUI, or plain REPL.
         (_, None) => {
-            let repo = build_repo(&args);
-            cli::run_interactive(PathBuf::from(&args.dir), args.model, repo, args.permission_mode).await
+            if args.ui {
+                ira::ui::run_ui(PathBuf::from(&args.dir), args.model, args.permission_mode).await
+            } else if args.tui {
+                let repo = build_repo(&args);
+                tui::run_tui(PathBuf::from(&args.dir), args.model, repo, args.permission_mode).await
+            } else {
+                let repo = build_repo(&args);
+                cli::run_interactive(PathBuf::from(&args.dir), args.model, repo, args.permission_mode).await
+            }
         }
     };
 

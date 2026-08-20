@@ -4,12 +4,14 @@
 pub mod declarative;
 pub mod env;
 pub mod eval;
+pub mod extract;
 pub mod goal;
 pub mod hooks;
 pub mod learning;
 pub mod loader;
 pub mod manifest;
 pub mod mcp;
+pub mod pdf;
 pub mod permissions;
 pub mod query;
 pub mod session;

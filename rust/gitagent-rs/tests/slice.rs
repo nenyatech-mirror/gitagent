@@ -1,25 +1,25 @@
 //! Integration tests for the engine + SDK.
 
 use futures_util::StreamExt;
-use gitagent::pi::compact::Compactor;
-use gitagent::pi::gate::{GateDecision, ToolGate};
-use gitagent::pi::message::{AgentMessage, AssistantMessage, ContentBlock, StopReason, ToolResultMessage, Usage};
-use gitagent::pi::provider::{is_transient_error, model_context_window, model_cost_per_mtok, resolve_model};
-use gitagent::sdk::query::{open_session, query, QueryOptions};
+use ira::pi::compact::Compactor;
+use ira::pi::gate::{GateDecision, ToolGate};
+use ira::pi::message::{AgentMessage, AssistantMessage, ContentBlock, StopReason, ToolResultMessage, Usage};
+use ira::pi::provider::{is_transient_error, model_context_window, model_cost_per_mtok, resolve_model};
+use ira::sdk::query::{open_session, query, QueryOptions};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc as StdArc;
-use gitagent::pi::tool::ExecutionMode;
-use gitagent::sdk::declarative::load_declarative_tools;
-use gitagent::sdk::env::load_env;
-use gitagent::sdk::loader::{discover_skills, discover_sub_agents, discover_workflows, load_agent};
-use gitagent::sdk::manifest::PermissionConfig;
-use gitagent::sdk::mcp::load_mcp_tools;
-use gitagent::sdk::permissions::PermissionGate;
-use gitagent::sdk::session::{init_local_session, RepoOptions};
-use gitagent::sdk::telemetry::Telemetry;
-use gitagent::sdk::tools::builtin_tools;
+use ira::pi::tool::ExecutionMode;
+use ira::sdk::declarative::load_declarative_tools;
+use ira::sdk::env::load_env;
+use ira::sdk::loader::{discover_skills, discover_sub_agents, discover_workflows, load_agent};
+use ira::sdk::manifest::PermissionConfig;
+use ira::sdk::mcp::load_mcp_tools;
+use ira::sdk::permissions::PermissionGate;
+use ira::sdk::session::{init_local_session, RepoOptions};
+use ira::sdk::telemetry::Telemetry;
+use ira::sdk::tools::builtin_tools;
 use serde_json::json;
 use std::collections::HashSet;
 use std::fs;
@@ -177,7 +177,7 @@ fn drain_query(mut opts: QueryOptions) -> String {
         let mut stream = query(opts).unwrap();
         let mut text = String::new();
         while let Some(ev) = stream.next().await {
-            if let gitagent::sdk::query::Event::Delta(t) = ev {
+            if let ira::sdk::query::Event::Delta(t) = ev {
                 text.push_str(&t);
             }
         }
@@ -191,6 +191,14 @@ fn resolve_model_parses_at_base_url() {
     let s = resolve_model("openai:gpt-4o-mini@http://localhost:8090/v1");
     assert_eq!(s.model_id, "gpt-4o-mini");
     assert_eq!(s.base_url, "http://localhost:8090/v1");
+}
+
+#[test]
+fn resolve_model_ollama_defaults_to_localhost() {
+    std::env::remove_var("GITAGENT_MODEL_BASE_URL");
+    let s = resolve_model("ollama:gemma3:4b");
+    assert_eq!(s.model_id, "gemma3:4b"); // model tag with a colon is preserved
+    assert_eq!(s.base_url, "http://localhost:11434/v1");
 }
 
 #[test]
@@ -436,7 +444,7 @@ fn declarative_tools_load_and_execute() {
 
 #[test]
 fn self_correcting_goal_loop_retries_until_verified() {
-    use gitagent::sdk::goal::{run_goal, Goal};
+    use ira::sdk::goal::{run_goal, Goal};
     std::env::set_var("OPENAI_API_KEY", "test");
 
     // Attempt 1: the model does nothing (no file) → verify fails.
@@ -479,7 +487,7 @@ fn self_correcting_goal_loop_retries_until_verified() {
 
 #[test]
 fn reflection_diagnoses_failure_and_feeds_next_attempt() {
-    use gitagent::sdk::goal::{run_goal, Goal};
+    use ira::sdk::goal::{run_goal, Goal};
     std::env::set_var("OPENAI_API_KEY", "test");
     let stop = |t: &str| format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"{t}\"}}}}]}}\n\ndata: [DONE]\n\n");
     let write = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"write\",\"arguments\":\"{\\\"path\\\":\\\"goal.txt\\\",\\\"content\\\":\\\"done\\\"}\"}}]}}]}\n\ndata: [DONE]\n\n";
@@ -577,7 +585,7 @@ fn subagents_run_in_parallel() {
 
 #[test]
 fn goal_move_advances_through_a_sequence() {
-    use gitagent::sdk::goal::{run_goals, Goal};
+    use ira::sdk::goal::{run_goals, Goal};
     std::env::set_var("OPENAI_API_KEY", "test");
     // The model just says "ok"; each goal's verify command is `true` (passes).
     let stop = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n";
@@ -602,6 +610,59 @@ fn transient_error_classification() {
     for m in ["provider error 400: bad request", "invalid api key", "model not found"] {
         assert!(!is_transient_error(m), "should NOT be transient: {m}");
     }
+}
+
+#[test]
+fn empty_assistant_turns_serialize_content_as_string() {
+    std::env::set_var("OPENAI_API_KEY", "test");
+    // Turn 1: the model emits ONLY reasoning (no text) → empty assistant message.
+    let reply = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"hmm\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".to_string();
+    let (base, log) = spawn_capturing_mock(reply);
+
+    let dir = tmp_dir("nilcontent");
+    fs::write(dir.join("agent.yaml"), format!("name: a\nmodel:\n  preferred: \"openai:m@{base}\"\n")).unwrap();
+
+    let session = open_session(dir.clone(), None, None, None).unwrap();
+    block_on(async {
+        let mut t1 = session.send("think about it");
+        while t1.next().await.is_some() {}
+        let mut t2 = session.send("now answer");
+        while t2.next().await.is_some() {}
+    });
+
+    let reqs = log.lock().unwrap();
+    assert_eq!(reqs.len(), 2);
+    // The replayed empty assistant turn must carry content:"" — a missing
+    // content field makes Ollama 400 with `invalid message content type: <nil>`.
+    let msgs_part: String = reqs[1].chars().skip(reqs[1].find("\"messages\"").unwrap_or(0)).take(600).collect();
+    assert!(reqs[1].contains(r#"{"content":"","role":"assistant"}"#),
+        "assistant content must be a string; messages were: {msgs_part}");
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn auto_continues_after_length_cut() {
+    std::env::set_var("OPENAI_API_KEY", "test");
+    // Request 1: output cut by max_tokens (finish_reason "length").
+    // Request 2: the remainder, finishing normally.
+    let part1 = "data: {\"choices\":[{\"delta\":{\"content\":\"function half() {\"},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n";
+    let part2 = "data: {\"choices\":[{\"delta\":{\"content\":\" return 42; }\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+    let (base, count) = spawn_mock_llm(move |i| (200, if i == 0 { part1.to_string() } else { part2.to_string() }));
+
+    let dir = tmp_dir("autocont");
+    fs::write(dir.join("agent.yaml"), "name: a\nmodel:\n  preferred: \"openai:m\"\n").unwrap();
+
+    let text = drain_query(QueryOptions {
+        dir: dir.clone(),
+        model: Some(format!("openai:m@{base}")),
+        prompt: "write the function".into(),
+        repo: None,
+        permission_mode: None,
+    });
+    assert!(text.contains("function half() {") && text.contains("return 42; }"),
+        "both halves streamed seamlessly: {text:?}");
+    assert_eq!(count.load(Ordering::SeqCst), 2, "auto-continued exactly once");
+    fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
@@ -655,9 +716,104 @@ fn falls_back_to_second_model_on_error() {
 }
 
 #[test]
+fn recovers_text_tool_call_from_local_model() {
+    use ira::pi::message::{ContentBlock, StopReason};
+    use ira::pi::provider::{stream_assistant, GenParams};
+    std::env::set_var("OPENAI_API_KEY", "test");
+    // A Gemma-style fenced JSON tool call arriving as plain content.
+    let inner = "```json\n{\"name\": \"read\", \"arguments\": {\"path\": \"x\"}}\n```";
+    let body = format!("data: {}\n\ndata: [DONE]\n\n", json!({"choices":[{"delta":{"content": inner}}]}));
+    let (base, _) = spawn_mock_llm(move |_| (200, body.clone()));
+    let spec = resolve_model(&format!("openai:m@{base}"));
+    let tools = builtin_tools(Path::new("/tmp")); // non-empty → enables the fallback
+    let cancel = CancellationToken::new();
+
+    let msg = block_on(async {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let m = stream_assistant(&reqwest::Client::new(), &spec, "sys", &[], &tools, &GenParams::default(), &cancel, &tx).await;
+        drop(tx);
+        let _ = drain.await;
+        m
+    });
+
+    let tc = msg.content.iter().find_map(|b| match b {
+        ContentBlock::ToolCall { name, arguments, .. } => Some((name.clone(), arguments.clone())),
+        _ => None,
+    });
+    assert_eq!(tc.as_ref().map(|(n, _)| n.as_str()), Some("read"), "text tool call recovered");
+    assert_eq!(tc.unwrap().1.get("path").and_then(|v| v.as_str()), Some("x"));
+    assert!(matches!(msg.stop_reason, StopReason::ToolUse));
+}
+
+#[test]
+fn muse_channels_split_into_thinking_and_answer() {
+    use ira::pi::message::{ContentBlock, StopReason};
+    use ira::pi::provider::{stream_assistant, GenParams};
+    std::env::set_var("OPENAI_API_KEY", "test");
+    // Muse-style dual-channel output arriving as plain content chunks.
+    let full = " to=self<|message|>User wants a greeting. Keep it short.<|start|>assistant to=user<|message|>Hello there!";
+    let (a, b) = full.split_at(30); // split mid-marker region to test buffering
+    let sse = format!(
+        "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+        json!({"choices":[{"delta":{"content": a}}]}),
+        json!({"choices":[{"delta":{"content": b}}]}),
+    );
+    let (base, _) = spawn_mock_llm(move |_| (200, sse.clone()));
+    let spec = resolve_model(&format!("ollama:muse-glimmer:q2@{base}"));
+    let cancel = CancellationToken::new();
+
+    let msg = block_on(async {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let m = stream_assistant(&reqwest::Client::new(), &spec, "sys", &[], &[], &GenParams::default(), &cancel, &tx).await;
+        drop(tx);
+        let _ = drain.await;
+        m
+    });
+
+    let think = msg.content.iter().find_map(|c| match c { ContentBlock::Thinking(t) => Some(t.clone()), _ => None }).unwrap_or_default();
+    assert!(think.contains("wants a greeting"), "reasoning captured: {think:?}");
+    assert!(!think.contains("<|"), "markers stripped from reasoning");
+    assert_eq!(msg.text().trim(), "Hello there!", "answer channel isolated");
+    assert!(matches!(msg.stop_reason, StopReason::Stop));
+}
+
+#[test]
+fn muse_short_plain_answer_not_swallowed() {
+    use ira::pi::message::{ContentBlock, StopReason};
+    use ira::pi::provider::{stream_assistant, GenParams};
+    std::env::set_var("OPENAI_API_KEY", "test");
+    // Official-template Muse: reasoning arrives in the `reasoning` field and the
+    // answer as SHORT plain content (<20 chars, no channel markers).
+    let sse = format!(
+        "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+        json!({"choices":[{"delta":{"reasoning":"user wants a greeting"}}]}),
+        json!({"choices":[{"delta":{"content":"hello world"},"finish_reason":"stop"}]}),
+    );
+    let (base, _) = spawn_mock_llm(move |_| (200, sse.clone()));
+    let spec = resolve_model(&format!("ollama:muse-glimmer:30b@{base}"));
+    let cancel = CancellationToken::new();
+
+    let msg = block_on(async {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let m = stream_assistant(&reqwest::Client::new(), &spec, "sys", &[], &[], &GenParams::default(), &cancel, &tx).await;
+        drop(tx);
+        let _ = drain.await;
+        m
+    });
+
+    assert_eq!(msg.text().trim(), "hello world", "short answer must never be swallowed");
+    let think = msg.content.iter().any(|c| matches!(c, ContentBlock::Thinking(t) if t.contains("greeting")));
+    assert!(think, "native reasoning field captured");
+    assert!(matches!(msg.stop_reason, StopReason::Stop));
+}
+
+#[test]
 fn captures_reasoning_and_length_finish() {
-    use gitagent::pi::message::{ContentBlock, StopReason};
-    use gitagent::pi::provider::{stream_assistant, GenParams};
+    use ira::pi::message::{ContentBlock, StopReason};
+    use ira::pi::provider::{stream_assistant, GenParams};
     std::env::set_var("OPENAI_API_KEY", "test");
     // Reasoning delta, then an answer truncated by length.
     let sse = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking hard\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"the answer\"},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n";
@@ -787,6 +943,63 @@ fn compliance_injected_into_prompt() {
     assert!(prompt.contains("# Compliance"));
     assert!(prompt.contains("SOC2"));
     assert!(prompt.contains("never exfiltrate secrets"));
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn read_tool_extracts_docx_and_pdf_text() {
+    use std::io::Write as _;
+    let dir = tmp_dir("extract");
+
+    // A minimal real .docx (zip with word/document.xml).
+    let docx_path = dir.join("roadmap.docx");
+    {
+        let f = fs::File::create(&docx_path).unwrap();
+        let mut z = zip::ZipWriter::new(f);
+        let opts = zip::write::SimpleFileOptions::default();
+        z.start_file("word/document.xml", opts).unwrap();
+        z.write_all(br#"<?xml version="1.0"?><w:document><w:body><w:p><w:r><w:t>Q3 Roadmap: ship Lyzr blocks</w:t></w:r></w:p><w:p><w:r><w:t>Phase two follows.</w:t></w:r></w:p></w:body></w:document>"#).unwrap();
+        z.finish().unwrap();
+    }
+    // A real PDF from our own writer.
+    fs::write(dir.join("doc.pdf"), ira::sdk::pdf::build_pdf(Some("Plan"), "Alpha beta gamma.")).unwrap();
+
+    let tools = builtin_tools(&dir);
+    let read = tools.iter().find(|t| t.name() == "read").unwrap();
+    let cancel = CancellationToken::new();
+
+    let d = block_on(read.execute("1", json!({"path":"roadmap.docx"}), &cancel)).unwrap();
+    assert!(d.content.contains("Q3 Roadmap: ship Lyzr blocks"), "docx text extracted: {}", &d.content[..d.content.len().min(200)]);
+    assert!(d.content.contains("Phase two follows."));
+
+    let p = block_on(read.execute("2", json!({"path":"doc.pdf"}), &cancel)).unwrap();
+    assert!(p.content.contains("Alpha beta gamma"), "pdf text extracted: {}", &p.content[..p.content.len().min(200)]);
+    assert!(p.content.contains("Plan"));
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn pdf_tool_writes_valid_multipage_pdf() {
+    use ira::sdk::pdf::build_pdf;
+    let dir = tmp_dir("pdf");
+    // Unit: structure of the generated bytes.
+    let long_body = (0..120).map(|i| format!("Paragraph {i} with enough words to wrap across the page width nicely.")).collect::<Vec<_>>().join("\n\n");
+    let bytes = build_pdf(Some("Test Doc"), &format!("# Heading\n\n- bullet one\n- bullet two\n\n{long_body}"));
+    assert!(bytes.starts_with(b"%PDF-1.4"), "valid header");
+    assert!(bytes.windows(6).any(|w| w == b"%%EOF\n"), "valid trailer");
+    let s = String::from_utf8_lossy(&bytes);
+    let count: u32 = s.split("/Count ").nth(1).and_then(|r| r.split('>').next()).and_then(|n| n.trim().parse().ok()).unwrap_or(0);
+    assert!(count >= 2, "long content paginates (got {count} pages)");
+    assert!(s.contains("Helvetica-Bold"), "headings use bold font");
+
+    // Tool: writes the file via the agent tool interface.
+    let tools = builtin_tools(&dir);
+    let pdf = tools.iter().find(|t| t.name() == "pdf").expect("pdf tool registered");
+    let cancel = CancellationToken::new();
+    let res = block_on(pdf.execute("1", json!({"path":"out.pdf","title":"Hi","content":"Hello world"}), &cancel)).unwrap();
+    assert!(res.content.contains("Wrote PDF"), "{}", res.content);
+    let written = fs::read(dir.join("out.pdf")).unwrap();
+    assert!(written.starts_with(b"%PDF-1.4"));
     fs::remove_dir_all(&dir).ok();
 }
 

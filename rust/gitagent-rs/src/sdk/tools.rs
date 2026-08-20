@@ -10,6 +10,7 @@ use crate::sdk::declarative::load_declarative_tools;
 use crate::sdk::learning::{SkillLearner, TaskTracker};
 use crate::sdk::loader::{discover_sub_agents, load_agent};
 use crate::sdk::mcp::load_mcp_tools;
+use crate::sdk::pdf::PdfTool;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
@@ -25,6 +26,7 @@ pub fn builtin_tools(dir: &Path) -> Vec<Arc<dyn AgentTool>> {
         Arc::new(WriteTool { cwd: dir.to_path_buf() }),
         Arc::new(EditTool { cwd: dir.to_path_buf() }),
         Arc::new(Memory { dir: dir.to_path_buf() }),
+        Arc::new(PdfTool { cwd: dir.to_path_buf() }),
         Arc::new(TaskTracker { dir: dir.to_path_buf() }),
         Arc::new(SkillLearner { dir: dir.to_path_buf() }),
     ];
@@ -127,7 +129,9 @@ pub struct Read {
 #[async_trait]
 impl AgentTool for Read {
     fn name(&self) -> &str { "read" }
-    fn description(&self) -> &str { "Read a UTF-8 text file (capped at ~100KB)." }
+    fn description(&self) -> &str {
+        "Read a file. Text is returned as-is; documents (.docx, .xlsx, .pptx, .pdf, .doc, .rtf, .odt) have their text extracted."
+    }
     fn parameters(&self) -> Value {
         json!({ "type": "object", "properties": { "path": { "type": "string" } }, "required": ["path"] })
     }
@@ -135,7 +139,18 @@ impl AgentTool for Read {
     fn execution_mode(&self) -> ExecutionMode { ExecutionMode::Parallel }
     async fn execute(&self, _id: &str, args: Value, _cancel: &CancellationToken) -> anyhow::Result<ToolResult> {
         let path = args.get("path").and_then(Value::as_str).unwrap_or_default();
-        let content = tokio::fs::read_to_string(resolve(&self.cwd, path)).await?;
+        let abs = resolve(&self.cwd, path);
+        // Documents: extract readable text instead of failing on binary bytes.
+        if crate::sdk::extract::is_document(&abs) {
+            let bytes = tokio::fs::read(&abs).await?;
+            return Ok(match crate::sdk::extract::extract_text(&abs, &bytes) {
+                Some(text) => ToolResult::text(tail(&format!("[extracted document text]\n{text}"), 100_000)),
+                None => ToolResult::text(format!(
+                    "Error: could not extract readable text from {path} (possibly scanned, encrypted, or an unsupported encoding)."
+                )),
+            });
+        }
+        let content = tokio::fs::read_to_string(&abs).await?;
         Ok(ToolResult::text(tail(&content, 100_000)))
     }
 }

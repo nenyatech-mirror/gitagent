@@ -1,13 +1,13 @@
-//! Terminal front-end for the gitagent SDK.
+//! Terminal front-end for Ira.
 //!
 //! This module is a *thin presentation layer*: it contains no agent logic and
-//! touches only the public SDK surface (`gitagent::sdk::query` / `::goal`). It
+//! touches only the public SDK surface (`ira::sdk::query` / `::goal`). It
 //! renders the SDK's `Event` stream — one-shot, interactive, or goal mode.
 
 use futures_util::{Stream, StreamExt};
-use gitagent::sdk::goal::{run_goal, Goal};
-use gitagent::sdk::query::{open_session, query, Event, QueryOptions};
-use gitagent::sdk::session::RepoOptions;
+use ira::sdk::goal::{run_goal, Goal};
+use ira::sdk::query::{open_session, query, Event, QueryOptions};
+use ira::sdk::session::RepoOptions;
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -117,7 +117,7 @@ where
     exit
 }
 
-fn usage_line(st: &Style, u: gitagent::sdk::query::RunUsage, prefix: &str) {
+fn usage_line(st: &Style, u: ira::sdk::query::RunUsage, prefix: &str) {
     if u.input_tokens + u.output_tokens > 0 {
         eprintln!(
             "{}",
@@ -162,7 +162,7 @@ pub async fn run_interactive(
         }
     };
 
-    eprintln!("{}", st.dim("gitagent — interactive. Type a message; Ctrl-D or /exit to quit."));
+    eprintln!("{}", st.dim("ira — interactive. Type a message; Ctrl-D or /exit to quit."));
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let mut exit = 0;
 

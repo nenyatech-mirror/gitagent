@@ -6,8 +6,8 @@
 //!   cargo run --example eval -- "openai:gpt-4o-mini"
 //!   cargo run --example eval -- "anthropic:claude-haiku-4-5@http://localhost:8090/v1"
 
-use gitagent::sdk::env::load_env;
-use gitagent::sdk::eval::{run_eval, EvalReport, EvalTask};
+use ira::sdk::env::load_env;
+use ira::sdk::eval::{run_eval, EvalReport, EvalTask};
 use std::path::PathBuf;
 
 fn task(name: &str, prompt: &str, verify: &str, setup: Option<&str>) -> EvalTask {
@@ -126,7 +126,7 @@ async fn main() {
 
     // Genuine self-corrections: tasks the loop recovered by taking >1 attempt.
     let baseline_failed: Vec<&str> = baseline.results.iter().filter(|r| !r.passed).map(|r| r.name.as_str()).collect();
-    let recovered: Vec<&gitagent::sdk::eval::TaskResult> =
+    let recovered: Vec<&ira::sdk::eval::TaskResult> =
         looped.results.iter().filter(|r| r.passed && r.attempts > 1).collect();
 
     let delta = (looped.pass_rate() - baseline.pass_rate()) * 100.0;

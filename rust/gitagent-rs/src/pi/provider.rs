@@ -76,14 +76,21 @@ pub fn model_cost_per_mtok(model_id: &str) -> (f64, f64) {
 }
 
 pub fn resolve_model(spec: &str) -> ModelSpec {
-    let rest = spec.split_once(':').map(|(_, r)| r).unwrap_or(spec);
+    // "provider:model[@baseurl]" — the provider prefix selects a default endpoint.
+    let (provider, rest) = spec.split_once(':').unwrap_or(("openai", spec));
     let (model_id, base_from_at) = match rest.split_once('@') {
         Some((m, b)) => (m.to_string(), Some(b.to_string())),
         None => (rest.to_string(), None),
     };
+    // Per-provider default endpoint (overridden by @baseurl or GITAGENT_MODEL_BASE_URL).
+    let default_base = match provider {
+        "ollama" => "http://localhost:11434/v1", // local models, no key needed
+        "anthropic" => "https://api.anthropic.com/v1",
+        _ => "https://api.openai.com/v1",
+    };
     let base_url = base_from_at
         .or_else(|| std::env::var("GITAGENT_MODEL_BASE_URL").ok())
-        .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+        .unwrap_or_else(|| default_base.to_string());
     let api_key = std::env::var("OPENAI_API_KEY")
         .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
         .unwrap_or_default();
@@ -146,8 +153,11 @@ fn to_chat_messages(system: &str, messages: &[AgentMessage]) -> Vec<ChatMessage>
                     })
                     .collect();
                 out.push(ChatMessage {
+                    // content must ALWAYS be a string: Ollama rejects a missing
+                    // content field with `invalid message content type: <nil>`
+                    // (empty assistant turns happen, e.g. thinking-only cuts).
                     role: "assistant".into(),
-                    content: (!text.is_empty()).then_some(text),
+                    content: Some(text),
                     tool_calls: (!tcs.is_empty()).then_some(tcs),
                     tool_call_id: None,
                 });
@@ -242,6 +252,14 @@ pub async fn stream_assistant(
 
     match stream_inner(client, spec, &chat, &tool_schemas, params, cancel, tx).await {
         Ok(msg) => msg,
+        // Some local models can't accept a tools param at all — degrade to a
+        // plain chat rather than failing the turn.
+        Err(e) if e.to_string().contains("does not support tools") && !tool_schemas.is_empty() => {
+            match stream_inner(client, spec, &chat, &[], params, cancel, tx).await {
+                Ok(msg) => msg,
+                Err(e2) => AssistantMessage::failure(StopReason::Error, e2.to_string()),
+            }
+        }
         Err(e) => AssistantMessage::failure(StopReason::Error, e.to_string()),
     }
 }
@@ -286,6 +304,8 @@ async fn stream_inner(
     let mut usage = Usage::default();
     let mut had_tool_calls = false;
     let mut finish_reason: Option<String> = None;
+    // Muse Glimmer interleaves a to=self reasoning channel in its text output.
+    let mut splitter = spec.model_id.to_lowercase().contains("muse").then(ChannelSplitter::new);
 
     loop {
         let chunk = tokio::select! {
@@ -335,8 +355,20 @@ async fn stream_inner(
             }
             if let Some(c) = delta.get("content").and_then(Value::as_str) {
                 if !c.is_empty() {
-                    text.push_str(c);
-                    let _ = tx.send(AgentEvent::MessageDelta { kind: DeltaKind::Text, text: c.to_string() }).await;
+                    if let Some(sp) = splitter.as_mut() {
+                        let (nt, na) = sp.push(c);
+                        if !nt.is_empty() {
+                            thinking.push_str(&nt);
+                            let _ = tx.send(AgentEvent::MessageDelta { kind: DeltaKind::Thinking, text: nt }).await;
+                        }
+                        if !na.is_empty() {
+                            text.push_str(&na);
+                            let _ = tx.send(AgentEvent::MessageDelta { kind: DeltaKind::Text, text: na }).await;
+                        }
+                    } else {
+                        text.push_str(c);
+                        let _ = tx.send(AgentEvent::MessageDelta { kind: DeltaKind::Text, text: c.to_string() }).await;
+                    }
                 }
             }
             if let Some(tcs) = delta.get("tool_calls").and_then(Value::as_array) {
@@ -363,12 +395,36 @@ async fn stream_inner(
         }
     }
 
+    // Flush the splitter's held tail (end of stream).
+    if let Some(sp) = splitter.as_mut() {
+        let (nt, na) = sp.finish();
+        if !nt.is_empty() {
+            thinking.push_str(&nt);
+            let _ = tx.send(AgentEvent::MessageDelta { kind: DeltaKind::Thinking, text: nt }).await;
+        }
+        if !na.is_empty() {
+            text.push_str(&na);
+            let _ = tx.send(AgentEvent::MessageDelta { kind: DeltaKind::Text, text: na }).await;
+        }
+    }
+
+    // Fallback: local models (e.g. Gemma via a tool template) often emit the tool
+    // call as text JSON rather than native tool_calls. If tools were offered and
+    // the whole reply is a tool-call object, recover it.
+    let text_tool_call = if !had_tool_calls && !tools.is_empty() {
+        extract_text_tool_call(&text)
+    } else {
+        None
+    };
+
     let mut content: Vec<ContentBlock> = Vec::new();
     // Thinking precedes the answer, mirroring how it was produced.
     if !thinking.is_empty() {
         content.push(ContentBlock::Thinking(thinking));
     }
-    if !text.is_empty() {
+    if let Some((name, args)) = text_tool_call.clone() {
+        content.push(ContentBlock::ToolCall { id: format!("call_{name}"), name, arguments: args });
+    } else if !text.is_empty() {
         content.push(ContentBlock::Text(text));
     }
     for (id, name, args) in acc.into_iter().filter(|(_, n, _)| !n.is_empty()) {
@@ -386,7 +442,7 @@ async fn stream_inner(
         usage.cost_usd = (usage.input as f64 / 1e6) * ci + (usage.output as f64 / 1e6) * co;
     }
 
-    let stop_reason = if had_tool_calls {
+    let stop_reason = if had_tool_calls || text_tool_call.is_some() {
         StopReason::ToolUse
     } else if finish_reason.as_deref() == Some("length") {
         StopReason::Length // response was truncated by max_tokens
@@ -394,4 +450,142 @@ async fn stream_inner(
         StopReason::Stop
     };
     Ok(AssistantMessage { content, stop_reason, error_message: None, usage })
+}
+
+/// Splits Muse Glimmer's dual-channel output into (reasoning, answer).
+/// Muse emits `to=self<|message|>…reasoning…<|start|>assistant to=user<|message|>…answer…`;
+/// we recompute the split over the accumulated text each push (immune to markers
+/// split across chunks) and hold back a small tail so a half-arrived marker is
+/// never shown. `finish()` flushes the tail.
+struct ChannelSplitter {
+    raw: String,
+    sent_think: usize,
+    sent_ans: usize,
+    /// End of stream: classify even short/ambiguous text (never swallow it).
+    done: bool,
+}
+
+const HOLD: usize = 44; // > longest marker: "<|start|>assistant to=user<|message|>"
+
+impl ChannelSplitter {
+    fn new() -> Self {
+        Self { raw: String::new(), sent_think: 0, sent_ans: 0, done: false }
+    }
+
+    fn scrub(s: &str) -> String {
+        s.replace("<|eot|>", "").replace("<|eom|>", "")
+    }
+
+    /// Current (thinking, answer) parse of the accumulated text.
+    fn parse(&self) -> (String, String) {
+        let s = self.raw.trim_start();
+        if let Some(rest) = s.strip_prefix("to=self<|message|>") {
+            // Reasoning first; the answer begins at the next assistant header.
+            if let Some(i) = rest.find("<|start|>assistant") {
+                let think = Self::scrub(&rest[..i]);
+                let after = &rest[i..];
+                let ans = after
+                    .find("<|message|>")
+                    .map(|j| Self::scrub(&after[j + "<|message|>".len()..]))
+                    .unwrap_or_default();
+                (think, ans)
+            } else if let Some(i) = rest.find("<|eom|>") {
+                (Self::scrub(&rest[..i]), Self::scrub(&rest[i + "<|eom|>".len()..]))
+            } else {
+                (Self::scrub(rest), String::new())
+            }
+        } else if let Some(rest) = s.strip_prefix("to=user<|message|>") {
+            (String::new(), Self::scrub(rest))
+        } else if let Some(rest) = s.strip_prefix("<|message|>") {
+            (String::new(), Self::scrub(rest))
+        } else if self.done || s.len() >= 20 || s.contains("<|message|>") {
+            // No channel header — plain answer. (At end-of-stream this branch
+            // is unconditional so short answers are never swallowed.)
+            (String::new(), Self::scrub(s))
+        } else {
+            (String::new(), String::new()) // undecided: hold
+        }
+    }
+
+    /// True when the accumulated text can't be channel-marked (plain output from
+    /// a native-template model) — no hold-back needed, stream in real time.
+    fn is_plain(&self) -> bool {
+        let s = self.raw.trim_start();
+        (self.done || s.len() >= 20) && !s.starts_with("to=") && !s.contains("<|")
+    }
+
+    /// Push a chunk; returns (new_thinking, new_answer) safe to emit now.
+    fn push(&mut self, chunk: &str) -> (String, String) {
+        self.raw.push_str(chunk);
+        self.drain(HOLD)
+    }
+
+    /// Flush everything (end of stream).
+    fn finish(&mut self) -> (String, String) {
+        self.done = true;
+        self.drain(0)
+    }
+
+    fn drain(&mut self, hold: usize) -> (String, String) {
+        let hold = if self.is_plain() { 0 } else { hold };
+        let (think, ans) = self.parse();
+        // Hold back the tail of whichever channel is currently growing.
+        let floor = |s: &str, mut i: usize| {
+            while i > 0 && !s.is_char_boundary(i) {
+                i -= 1;
+            }
+            i
+        };
+        let (t_avail, a_avail) = if ans.is_empty() {
+            (floor(&think, think.len().saturating_sub(hold)), 0)
+        } else {
+            (think.len(), floor(&ans, ans.len().saturating_sub(hold)))
+        };
+        let t_avail = t_avail.max(self.sent_think.min(think.len()));
+        let a_avail = a_avail.max(self.sent_ans.min(ans.len()));
+        let new_t = if t_avail > self.sent_think {
+            let s = think[self.sent_think..t_avail].to_string();
+            self.sent_think = t_avail;
+            s
+        } else {
+            String::new()
+        };
+        let new_a = if a_avail > self.sent_ans {
+            let s = ans[self.sent_ans..a_avail].to_string();
+            self.sent_ans = a_avail;
+            s
+        } else {
+            String::new()
+        };
+        (new_t, new_a)
+    }
+}
+
+/// Recover a tool call emitted as text/JSON (fenced or `<tool_call>`-wrapped),
+/// for local models that don't return native `tool_calls`. Returns the tool name
+/// and arguments only if the reply is unambiguously a single tool-call object.
+fn extract_text_tool_call(text: &str) -> Option<(String, Value)> {
+    let mut t = text.trim();
+    // Strip a <tool_call>…</tool_call> wrapper.
+    if let Some(inner) = t.strip_prefix("<tool_call>") {
+        t = inner.strip_suffix("</tool_call>").unwrap_or(inner).trim();
+    }
+    // Strip a ```json … ``` (or bare ```) fence.
+    if let Some(inner) = t.strip_prefix("```") {
+        let inner = inner.strip_prefix("json").unwrap_or(inner);
+        t = inner.trim_end_matches('`').trim();
+    }
+    let v: Value = serde_json::from_str(t.trim()).ok()?;
+    let obj = v.as_object()?;
+    let name = obj.get("name")?.as_str()?.to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let args = obj.get("arguments").or_else(|| obj.get("parameters")).cloned().unwrap_or_else(|| json!({}));
+    // Arguments may themselves be a JSON string.
+    let args = match args {
+        Value::String(s) => serde_json::from_str(&s).unwrap_or(Value::Object(Default::default())),
+        other => other,
+    };
+    Some((name, args))
 }

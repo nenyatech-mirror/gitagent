@@ -180,7 +180,11 @@ fn build_agent(
 
     let loaded = loader::load_agent(&dir)?;
     let model = model.unwrap_or_else(|| loaded.manifest.model.preferred.clone());
-    let tools = builtin_tools(&dir);
+    // Tool allow-list: omitted → all; `[]` → none (tool-less models); list → those.
+    let mut tools = builtin_tools(&dir);
+    if let Some(allow) = loaded.manifest.tools.as_ref() {
+        tools.retain(|t| allow.iter().any(|a| a == t.name()));
+    }
 
     // Sampling constraints (manifest.model.constraints → provider request).
     let params = loaded

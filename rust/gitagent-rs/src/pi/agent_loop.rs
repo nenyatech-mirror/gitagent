@@ -68,6 +68,7 @@ pub async fn run_loop(
 
     let mut first_turn = true;
     let mut turns = 0u32; // total assistant turns this run (for max_turns)
+    let mut continues = 0u32; // auto-continues after max_tokens cuts (bounded)
     let mut pending = drain(&config.steering);
 
     'outer: loop {
@@ -142,6 +143,16 @@ pub async fn run_loop(
                     ctx.messages.push(r.clone());
                     new_messages.push(r);
                 }
+            } else if stop == StopReason::Length && continues < 3 {
+                // The output was cut by max_tokens mid-generation — auto-continue
+                // (bounded) so long answers don't strand the user mid-line.
+                continues += 1;
+                let nudge = AgentMessage::User(
+                    "Continue EXACTLY where you stopped. Output only the remainder — no repetition, no preamble.".into(),
+                );
+                ctx.messages.push(nudge.clone());
+                new_messages.push(nudge);
+                has_more = true;
             }
 
             emit(&tx, AgentEvent::TurnEnd).await;

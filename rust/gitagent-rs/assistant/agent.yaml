@@ -3,15 +3,13 @@ name: assistant
 description: A sharp, concise engineering & research assistant.
 
 model:
-  # Sonnet via Anthropic's OpenAI-compatible endpoint.
-  preferred: "anthropic:claude-sonnet-4-5@https://api.anthropic.com/v1"
-  # Falls back to the cheaper/faster model if Sonnet errors.
-  fallback:
-    - "anthropic:claude-haiku-4-5@https://api.anthropic.com/v1"
+  # OpenAI.
+  preferred: "openai:gpt-4o-mini@https://api.openai.com/v1"
+  fallback: []
   constraints:
-    max_tokens: 8192   # required by Anthropic
+    max_tokens: 4096
 
-tools: [cli, read, write, edit, memory]
+tools: [cli, read, write, edit, memory, pdf]
 
 runtime:
   max_turns: 40

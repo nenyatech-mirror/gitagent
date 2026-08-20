@@ -1,16 +1,16 @@
 [package]
-name = "gitagent"
+name = "ira"
 version = "0.1.0"
 edition = "2021"
-description = "Git-native AI agent — Rust port (faithful pi-core engine + gitagent SDK)"
+description = "Ira — a git-native AI agent (faithful pi-core engine + gitagent-compatible SDK)"
 license = "MIT"
 
 [lib]
-name = "gitagent"
+name = "ira"
 path = "src/lib.rs"
 
 [[bin]]
-name = "gitagent"
+name = "ira"
 path = "src/main.rs"
 
 [dependencies]
@@ -25,3 +25,8 @@ futures-util = "0.3"
 async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+tiny_http = "0.12"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+flate2 = "1"
