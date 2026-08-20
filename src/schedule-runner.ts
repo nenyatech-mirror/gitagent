@@ -23,6 +23,12 @@ export async function startScheduler(opts: SchedulerOptions): Promise<void> {
 	const schedules = await discoverSchedules(opts.agentDir);
 	let activeCount = 0;
 
+	// cron/timer callbacks don't await the job; without this .catch a rejected
+	// job becomes an unhandled rejection that crashes the whole process.
+	const runJob = (s: ScheduleDefinition, disableAfterRun: boolean) =>
+		executeScheduledJob(s, opts, disableAfterRun).catch((e) =>
+			console.error(`[scheduler] job "${s.id}" failed:`, e?.message ?? e));
+
 	for (const schedule of schedules) {
 		if (!schedule.enabled) continue;
 
@@ -34,7 +40,7 @@ export async function startScheduler(opts: SchedulerOptions): Promise<void> {
 				continue;
 			}
 			const timer = setTimeout(() => {
-				executeScheduledJob(schedule, opts, true);
+				runJob(schedule, true);
 			}, delay);
 			activeTimers.set(schedule.id, timer);
 			const when = new Date(schedule.runAt).toLocaleString();
@@ -47,7 +53,7 @@ export async function startScheduler(opts: SchedulerOptions): Promise<void> {
 				continue;
 			}
 			const task = cron.schedule(schedule.cron, () => {
-				executeScheduledJob(schedule, opts, true);
+				runJob(schedule, true);
 			});
 			activeTasks.set(schedule.id, task);
 			activeCount++;
@@ -58,7 +64,7 @@ export async function startScheduler(opts: SchedulerOptions): Promise<void> {
 				continue;
 			}
 			const task = cron.schedule(schedule.cron, () => {
-				executeScheduledJob(schedule, opts, false);
+				runJob(schedule, false);
 			});
 			activeTasks.set(schedule.id, task);
 			activeCount++;
@@ -94,13 +100,14 @@ export async function executeScheduledJob(schedule: ScheduleDefinition, opts: Sc
 	const ts = new Date().toISOString();
 	console.log(dim(`[scheduler] Running "${schedule.id}" at ${ts}`));
 
+	let result = "";
+	let success = true;
+
+	try {
 	// Broadcast schedule start to chat
 	const startMsg = { type: "schedule_start", id: schedule.id, prompt: schedule.prompt, ts } as any;
 	opts.broadcastToBrowsers(startMsg as ServerMessage);
 	opts.appendToHistory(startMsg);
-
-	let result = "";
-	let success = true;
 
 	try {
 		result = await opts.runPrompt(schedule.prompt);
@@ -150,7 +157,8 @@ export async function executeScheduledJob(schedule: ScheduleDefinition, opts: Sc
 	} as any;
 	opts.broadcastToBrowsers(endMsg as ServerMessage);
 	opts.appendToHistory(endMsg);
-
-	runningJobs.delete(schedule.id);
-	console.log(dim(`[scheduler] "${schedule.id}" completed (${success ? "success" : "error"})`));
+	} finally {
+		runningJobs.delete(schedule.id);
+		console.log(dim(`[scheduler] "${schedule.id}" completed (${success ? "success" : "error"})`));
+	}
 }

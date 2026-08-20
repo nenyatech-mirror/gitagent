@@ -1,5 +1,5 @@
 import { Agent } from "@mariozechner/pi-agent-core";
-import type { AgentEvent, AgentTool } from "@mariozechner/pi-agent-core";
+import type { AgentEvent, AgentTool, AgentMessage } from "@mariozechner/pi-agent-core";
 import type { AssistantMessage } from "@mariozechner/pi-ai";
 import { loadAgent } from "./loader.js";
 import type { AgentManifest } from "./loader.js";
@@ -97,6 +97,8 @@ export function query(options: QueryOptions): Query {
 	// These are set once the agent is loaded (async init below)
 	let _sessionId = options.sessionId ?? "";
 	let _manifest: AgentManifest | null = null;
+	// Reference to the live engine so abort()/steer() actually reach it.
+	let agentRef: Agent | null = null;
 
 	// Accumulate streaming deltas for the current message
 	let accText = "";
@@ -319,6 +321,15 @@ export function query(options: QueryOptions): Query {
 				...modelOptions,
 			},
 		});
+		agentRef = agent;
+		// Wire cancellation: q.abort() (via ac) and any consumer-supplied
+		// options.abortController now actually stop the running agent. Previously
+		// ac.abort() was a no-op because the signal was never threaded here.
+		const onAbort = () => {
+			try { agent.abort(); } catch { /* already stopped */ }
+		};
+		if (ac.signal.aborted) onAbort();
+		else ac.signal.addEventListener("abort", onAbort, { once: true });
 
 		// 9. Subscribe to events and map to GCMessage
 		agent.subscribe((event: AgentEvent) => {
@@ -551,28 +562,23 @@ export function query(options: QueryOptions): Query {
 			}
 		}
 
-		// Finalize local session if active
-		if (localSession) {
-			try { localSession.finalize(); } catch { /* best-effort */ }
-		}
-
-		// Stop sandbox if active
-		if (sandboxCtx) {
-			await sandboxCtx.gitMachine.stop().catch(() => {});
-		}
-
 		// Ensure channel finishes even if no agent_end event
 		channel.finish();
 		} finally {
-			// Tear down MCP servers on every exit path — success, hook-block
-			// early-return, abort, and error (this finally runs before the
-			// .catch() handler below). cleanup() is idempotent.
+			// Cleanup on EVERY exit path — success, hook-block early-return, abort,
+			// and error (this finally runs before the .catch() below). Previously
+			// finalize/sandbox-stop lived only on the success and error paths, so a
+			// blocking hook leaked the sandbox VM and left the PAT in .git/config.
+			// All of these are idempotent / best-effort.
+			if (localSession) {
+				try { localSession.finalize(); } catch { /* best-effort */ }
+			}
+			if (sandboxCtx) {
+				await sandboxCtx.gitMachine.stop().catch(() => {});
+			}
 			if (mcpSetup) {
 				try { await mcpSetup.cleanup(); } catch { /* best-effort */ }
 			}
-			// Close the session span on every exit path — success, hook-block
-			// early-return, and the .catch() handler below (rethrow so this
-			// runs first).
 			try {
 				_session.end({ "gitagent.cost_usd": _totalCostUsd });
 			} catch {
@@ -580,15 +586,8 @@ export function query(options: QueryOptions): Query {
 			}
 		}
 	})().catch(async (err) => {
-		// Finalize local session on error
-		if (localSession) {
-			try { localSession.finalize(); } catch { /* best-effort */ }
-		}
-
-		// Stop sandbox on error
-		if (sandboxCtx) {
-			await sandboxCtx.gitMachine.stop().catch(() => {});
-		}
+		// Session finalize + sandbox stop already ran in the finally above (which
+		// executes before this .catch). Just surface the error.
 
 		// Fire on_error hooks
 		if (options.hooks?.onError) {
@@ -613,7 +612,10 @@ export function query(options: QueryOptions): Query {
 			ac.abort();
 		},
 
-		steer(_message: string) {
+		steer(message: string) {
+			// Queue a user message to be injected after the current tool batch —
+			// the engine drains it between turns. Was a no-op before.
+			agentRef?.steer({ role: "user", content: message } as AgentMessage);
 		},
 
 		sessionId() {
@@ -639,11 +641,14 @@ export function query(options: QueryOptions): Query {
 		},
 
 		return(value?: any) {
+			// Breaking out of `for await` cancels the agent (was: kept running).
+			ac.abort();
 			channel.finish();
 			return Promise.resolve({ value, done: true as const });
 		},
 
 		throw(err?: any) {
+			ac.abort();
 			channel.finish();
 			return Promise.reject(err);
 		},

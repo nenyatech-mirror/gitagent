@@ -12,6 +12,9 @@ export function toAgentTool(def: GCToolDefinition): AgentTool<any> {
 		label: def.name,
 		description: def.description,
 		parameters: schema,
+		// Fail-closed: SDK tools may have side effects, so don't let the engine
+		// run them concurrently with other tool calls in the same turn.
+		executionMode: "sequential",
 		execute: async (
 			_toolCallId: string,
 			params: any,

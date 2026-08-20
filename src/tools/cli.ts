@@ -25,25 +25,45 @@ export function createCliTool(cwd: string, defaultTimeout?: number): AgentTool<t
 				}
 
 				// shell: true routes through cmd.exe on Windows and /bin/sh elsewhere.
-				// cmd.exe has different quoting/escaping rules than sh (e.g. &, |, ^, >,
-				// embedded quotes behave differently) — commands may need to account for this.
+				const isWin = process.platform === "win32";
 				const child = spawn(command, {
 					cwd,
 					stdio: ["ignore", "pipe", "pipe"],
 					env: { ...process.env },
 					shell: true,
+					// Own process group on POSIX so we can kill the whole tree. A bare
+					// child.kill() hits only the shell, leaving grandchildren (e.g.
+					// `foo &`) alive and holding the stdout pipe open — 'close' then
+					// never fires and the tool hangs forever.
+					detached: !isWin,
 				});
 
 				let output = "";
 				let timedOut = false;
+				let forceKill: ReturnType<typeof setTimeout> | undefined;
+
+				const killTree = (sig: NodeJS.Signals) => {
+					try {
+						if (!isWin && child.pid) process.kill(-child.pid, sig);
+						else child.kill(sig);
+					} catch { /* already exited */ }
+				};
+				// SIGTERM the group, then SIGKILL it if it doesn't die within 3s.
+				const terminate = () => {
+					killTree("SIGTERM");
+					forceKill = setTimeout(() => killTree("SIGKILL"), 3000);
+				};
 
 				const timeoutHandle = setTimeout(() => {
 					timedOut = true;
-					child.kill("SIGTERM");
+					terminate();
 				}, timeoutSecs * 1000);
 
 				const onData = (data: Buffer) => {
 					output += data.toString("utf-8");
+					// Bound memory: keep a rolling tail rather than buffering GBs from
+					// a runaway command (e.g. `yes`).
+					if (output.length > MAX_OUTPUT * 2) output = output.slice(-MAX_OUTPUT);
 
 					if (onUpdate && output.length <= MAX_OUTPUT) {
 						onUpdate({
@@ -57,7 +77,7 @@ export function createCliTool(cwd: string, defaultTimeout?: number): AgentTool<t
 				child.stderr?.on("data", onData);
 
 				const onAbort = () => {
-					child.kill("SIGTERM");
+					terminate();
 				};
 
 				if (signal) {
@@ -66,12 +86,14 @@ export function createCliTool(cwd: string, defaultTimeout?: number): AgentTool<t
 
 				child.on("error", (err) => {
 					clearTimeout(timeoutHandle);
+					if (forceKill) clearTimeout(forceKill);
 					if (signal) signal.removeEventListener("abort", onAbort);
 					reject(err);
 				});
 
 				child.on("close", (code) => {
 					clearTimeout(timeoutHandle);
+					if (forceKill) clearTimeout(forceKill);
 					if (signal) signal.removeEventListener("abort", onAbort);
 
 					if (signal?.aborted) {

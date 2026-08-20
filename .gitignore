@@ -13,3 +13,7 @@ workspace/
 memory/.latest-frame.jpg
 memory/.latest-screen.jpg
 .DS_Store
+.basecode/
+.cursor/
+.vscode/
+.mcp.json

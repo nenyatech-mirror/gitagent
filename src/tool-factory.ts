@@ -43,6 +43,11 @@ export function buildTool<T = any>(def: ToolDefinition<T>): AgentTool<any> & { m
 		description: def.description,
 		parameters: schema,
 		metadata,
+		// pi-agent-core parallelizes tool calls unless the tool sets
+		// executionMode:"sequential" — it does NOT read our isConcurrencySafe.
+		// Map our fail-closed flag onto the field the engine actually honors so
+		// non-concurrency-safe tools don't race.
+		executionMode: metadata.isConcurrencySafe ? "parallel" : "sequential",
 		async execute(
 			toolCallId: string,
 			params: unknown,

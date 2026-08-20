@@ -1,0 +1,17 @@
+{
+  "productName": "Ira",
+  "version": "0.1.0",
+  "identifier": "ai.ira.desktop",
+  "build": {
+    "frontendDist": "assets"
+  },
+  "app": {
+    "windows": [],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": false
+  }
+}
